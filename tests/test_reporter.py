@@ -1,164 +1,152 @@
 """Tests for analysis/reporter.py"""
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch, MagicMock
-
 import pytest
-
+from analysis.anomalies import Anomaly
+from analysis.investigations import Investigation, CauseLink
+from analysis.correlations import CorrelationsReport, BounceBack, SleepRecoveryQuantified, DayOfWeekPattern
 from analysis.reporter import (
     format_morning_brief,
     format_post_workout,
     format_weekly_digest,
     format_alert,
-    send_telegram,
-    save_insight,
+    _fmt_anomaly,
+    _fmt_investigation,
 )
-from analysis.sleep import SleepReport, SleepTrend, StageAnalysis, ConsistencyAnalysis, SleepDebt
-from analysis.recovery import RecoveryReport, RecoveryTrend, RecoveryPrediction
-from analysis.strain import StrainReport, AcuteChronicLoad, StrainRecoveryBalance, OvertrainingSignal, WorkoutDistribution
-from analysis.anomalies import Anomaly
-from analysis.investigations import Investigation, CauseLink
-from analysis.correlations import CorrelationsReport, SleepRecoveryQuantified, BounceBack
 
 
-NOW = datetime.now(timezone.utc)
-
-
-def _sleep_report(**kwargs):
-    defaults = dict(
-        date=NOW, last_sleep_duration_hrs=7.2, duration_vs_baseline_pct=-5.0,
-        duration_z_score=-0.4, efficiency_pct=92.0,
-        trend=SleepTrend(duration_slope_hrs_per_day=-0.1, duration_7d_avg_hrs=7.0, duration_14d_avg_hrs=7.3, direction="stable"),
-        stages=StageAnalysis(current_rem_pct=28.0, current_deep_pct=15.0, current_light_pct=57.0,
-                             baseline_rem_pct=25.0, baseline_deep_pct=16.0, baseline_light_pct=59.0,
-                             rem_z_score=0.5, deep_z_score=-0.3, rem_flag=None, deep_flag=None),
-        consistency=ConsistencyAnalysis(bedtime_std_minutes=25, waketime_std_minutes=20, consistency_score=75, consistency_recovery_correlation=None),
-        debt=SleepDebt(baseline_need_hrs=7.8, current_debt_hrs=3.2, trend="stable", days_analyzed=7),
-        flags=[],
+def _anomaly(metric="hrv", severity="watch", z=-2.0):
+    return Anomaly(
+        metric=metric, severity=severity, z_score=z,
+        current_value=30.0, baseline_mean=50.0, baseline_std=10.0,
+        direction="below", sustained_days=1,
+        description=f"{metric} low", fingerprint=f"fp_{metric}",
     )
-    defaults.update(kwargs)
-    return SleepReport(**defaults)
 
 
-def _recovery_report(**kwargs):
-    defaults = dict(
-        date=NOW, latest_score=72.0, score_vs_baseline_pct=3.0, score_z=0.2,
-        trend=RecoveryTrend(slope_per_day=0.5, avg_7d=70.0, avg_14d=68.0, direction="stable"),
-        prediction=None, sleep_correlation=None, flags=[],
+def _investigation(anomaly=None):
+    a = anomaly or _anomaly()
+    return Investigation(
+        anomaly=a, hypothesis="sleep_debt", confidence="high",
+        cause_chain=[
+            CauseLink(metric="sleep_duration", observation="Short sleep (5.5h)", days_prior=0, value=5.5),
+            CauseLink(metric="sleep_duration", observation="Short sleep (5.0h)", days_prior=1, value=5.0),
+        ],
+        recommendation="Prioritize sleep tonight.",
+        supporting_signals=2,
     )
-    defaults.update(kwargs)
-    return RecoveryReport(**defaults)
 
 
-def _strain_report(**kwargs):
-    defaults = dict(
-        date=NOW, latest_day_strain=14.5, strain_vs_baseline_pct=15.0, strain_z=0.8,
-        acute_chronic=AcuteChronicLoad(acute_7d=13.0, chronic_30d=11.0, ratio=1.18, risk_level="moderate"),
-        balance=StrainRecoveryBalance(avg_strain_7d=13.0, avg_recovery_7d=70.0, strain_recovery_ratio=0.88, ratio_trend="balanced", drift_direction=None),
-        overtraining=OvertrainingSignal(detected=False, strain_trend_slope=0.1, recovery_trend_slope=-0.2, days_analyzed=14, confidence="low"),
-        workout_dist=WorkoutDistribution(total_workouts=5, avg_strain_per_workout=10.0, high_intensity_count=1, moderate_count=3, low_count=1, avg_duration_minutes=45, sport_breakdown={"activity": 5}),
-        flags=[],
-    )
-    defaults.update(kwargs)
-    return StrainReport(**defaults)
+class TestMorningBrief:
+    def test_green_recovery(self):
+        result = format_morning_brief(85, 55, 58, 97.0, 7.5, "Good", [], [])
+        assert "🟢" in result
+        assert "85%" in result
+        assert "All metrics within normal range" in result
 
+    def test_red_recovery(self):
+        result = format_morning_brief(25, 30, 70, 95.0, 5.0, None, [], [])
+        assert "🔴" in result
 
-def _anomaly(metric="recovery", severity="watch", value=45.0):
-    return Anomaly(metric=metric, severity=severity, z_score=-2.0, current_value=value,
-                   baseline_mean=70.0, baseline_std=10.0, direction="below",
-                   sustained_days=1, description=f"{metric} below baseline", fingerprint="abc")
-
-
-class TestFormatMorningBrief:
-    def test_basic(self):
-        msg = format_morning_brief(_sleep_report(), _recovery_report(), [], [])
-        assert "Morning Brief" in msg
-        assert "Sleep" in msg
-        assert "Recovery" in msg
-        assert "7.2h" in msg
+    def test_yellow_recovery(self):
+        result = format_morning_brief(50, 45, 62, 96.0, 7.0, None, [], [])
+        assert "🟡" in result
 
     def test_with_anomalies(self):
-        anomalies = [_anomaly()]
-        inv = Investigation(
-            anomaly=anomalies[0],
-            cause_chain=[CauseLink(factor="Short sleep", evidence="5h vs 7.5h", contribution="likely")],
-            summary="Low recovery likely driven by short sleep.",
-            confidence="medium",
-        )
-        msg = format_morning_brief(_sleep_report(), _recovery_report(latest_score=25.0), anomalies, [inv])
-        assert "Alert" in msg
-        assert "Rest day" in msg
+        anomalies = [_anomaly(severity="alert")]
+        result = format_morning_brief(30, 25, 72, 92.0, 5.0, None, anomalies, [])
+        assert "🚨" in result
+        assert "ALERT" in result
+        assert "All metrics within normal range" not in result
 
-    def test_high_recovery(self):
-        msg = format_morning_brief(_sleep_report(), _recovery_report(latest_score=85.0), [], [])
-        assert "high intensity" in msg.lower()
+    def test_with_investigations(self):
+        inv = _investigation()
+        result = format_morning_brief(30, 25, 72, 92.0, 5.0, None, [_anomaly()], [inv])
+        assert "sleep_debt" in result.lower() or "Sleep Debt" in result
+        assert "Prioritize sleep" in result
+
+    def test_none_values_handled(self):
+        result = format_morning_brief(None, None, None, None, None, None, [], [])
+        assert "Morning Brief" in result
+
+    def test_info_anomalies_not_shown(self):
+        anomalies = [_anomaly(severity="info")]
+        result = format_morning_brief(65, 50, 60, 96.0, 7.0, None, anomalies, [])
+        assert "All metrics within normal range" in result
 
 
-class TestFormatPostWorkout:
+class TestPostWorkout:
     def test_basic(self):
-        msg = format_post_workout(_strain_report(), _recovery_report())
-        assert "Post-Workout" in msg
-        assert "14.5" in msg
+        result = format_post_workout(14.5, 1.2, "Running", 45, 155, 178, 450)
+        assert "14.5" in result
+        assert "Running" in result
+        assert "45 min" in result
 
-    def test_high_strain(self):
-        msg = format_post_workout(_strain_report(latest_day_strain=18.0), _recovery_report())
-        assert "lower recovery" in msg.lower()
+    def test_high_strain_advice(self):
+        result = format_post_workout(18.0, 2.5, "CrossFit", 60, 165, 190, 700)
+        assert "prioritize sleep" in result.lower()
 
-    def test_with_overtraining(self):
-        report = _strain_report(
-            overtraining=OvertrainingSignal(detected=True, strain_trend_slope=0.8, recovery_trend_slope=-1.5, days_analyzed=14, confidence="high"),
-            flags=["Overtraining signal detected"],
-        )
-        msg = format_post_workout(report, _recovery_report())
-        assert "Overtraining" in msg
+    def test_above_average_z(self):
+        result = format_post_workout(16.0, 2.3, None, None, None, None, None)
+        assert "above" in result.lower() or "⬆️" in result
+
+    def test_below_average_z(self):
+        result = format_post_workout(8.0, -1.5, None, None, None, None, None)
+        assert "below" in result.lower() or "↘️" in result
+
+    def test_none_optionals(self):
+        result = format_post_workout(12.0, None, None, None, None, None, None)
+        assert "12.0" in result
 
 
-class TestFormatWeeklyDigest:
+class TestWeeklyDigest:
     def test_basic(self):
-        corr = CorrelationsReport(
-            day_of_week=[],
-            bounce_back=BounceBack(avg_days_to_recover=1.5, high_strain_threshold=15, recovery_threshold=65, sample_count=4),
-            sleep_to_recovery=SleepRecoveryQuantified(correlation=0.6, p_value=0.01, slope=5.2, intercept=30, r_squared=0.36, sample_size=14, interpretation="Strong: each extra hour → ~5 recovery points"),
-            notable_correlations=[],
+        result = format_weekly_digest(65, 50, 7.2, 13.5, "Tuesday", "Friday", None, 3, 1)
+        assert "Weekly Digest" in result
+        assert "65%" in result
+        assert "Tuesday" in result
+        assert "3 anomalies" in result
+
+    def test_with_correlations(self):
+        s2r = SleepRecoveryQuantified(
+            correlation=0.65, p_value=0.01, slope=8.5, intercept=10,
+            r_squared=0.42, sample_size=20,
+            interpretation="Strong: each extra hour → ~8.5 recovery points",
         )
-        msg = format_weekly_digest(_sleep_report(), _recovery_report(), _strain_report(), corr, [])
-        assert "Weekly Digest" in msg
-        assert "Trends" in msg
-        assert "bounce-back" in msg.lower()
+        bb = BounceBack(avg_days_to_recover=1.5, high_strain_threshold=16, recovery_threshold=60, sample_count=5)
+        dow = [DayOfWeekPattern(
+            metric="recovery", day_averages={"Mon": 70, "Fri": 50},
+            best_day="Monday", worst_day="Friday", significant=True,
+        )]
+        report = CorrelationsReport(day_of_week=dow, bounce_back=bb, sleep_to_recovery=s2r, notable_correlations=[])
+        result = format_weekly_digest(65, 50, 7.2, 13.5, None, None, report, 0, 0)
+        assert "8.5" in result
+        assert "1.5 days" in result
+        assert "Monday" in result
+
+    def test_none_values(self):
+        result = format_weekly_digest(None, None, None, None, None, None, None, 0, 0)
+        assert "Weekly Digest" in result
 
 
-class TestFormatAlert:
+class TestAlert:
     def test_basic(self):
-        a = _anomaly(severity="alert", metric="spo2", value=91.0)
-        msg = format_alert(a)
-        assert "SPO2" in msg
-        assert "🔴" in msg
+        result = format_alert(_anomaly(severity="alert"))
+        assert "🚨" in result
 
     def test_with_investigation(self):
-        a = _anomaly()
-        inv = Investigation(
-            anomaly=a,
-            cause_chain=[CauseLink(factor="Short sleep", evidence="5h", contribution="likely")],
-            summary="Low recovery from short sleep.",
-            confidence="medium",
-        )
-        msg = format_alert(a, inv)
-        assert "Investigation" in msg
-        assert "Short sleep" in msg
+        a = _anomaly(severity="alert")
+        inv = _investigation(a)
+        result = format_alert(a, inv)
+        assert "Likely cause" in result
 
 
-@pytest.mark.asyncio
-async def test_send_telegram_no_config():
-    """Without config, should return False gracefully."""
-    result = await send_telegram("test")
-    assert result is False
+class TestFormatHelpers:
+    def test_fmt_anomaly(self):
+        result = _fmt_anomaly(_anomaly(severity="watch"))
+        assert "⚠️" in result
+        assert "WATCH" in result
 
-
-@pytest.mark.asyncio
-async def test_save_insight():
-    session = AsyncMock()
-    session.add = MagicMock()
-    session.commit = AsyncMock()
-    await save_insight(session, "morning_brief", {"test": True}, "test message")
-    session.add.assert_called_once()
-    session.commit.assert_called_once()
+    def test_fmt_investigation(self):
+        result = _fmt_investigation(_investigation())
+        assert "Sleep Debt" in result
+        assert "Today" in result

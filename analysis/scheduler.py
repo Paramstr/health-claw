@@ -1,276 +1,231 @@
 """
-analysis/scheduler.py — Orchestrates analysis runs.
+analysis/scheduler.py — Orchestrator that ties all analysis modules together.
 
-Entry points:
-- handle_sleep_event(payload) — triggered by sleep webhook
-- handle_workout_event(payload) — triggered by workout webhook
-- handle_recovery_event(payload) — triggered by recovery webhook
-- run_morning_brief(date) — manual or cron trigger
-- run_weekly_digest(week_end_date) — manual or cron trigger
+Runs:
+- morning_brief: Triggered after sleep data arrives (or on schedule ~7-8am)
+- post_workout: Triggered by webhook when workout completes
+- weekly_digest: Sunday evening
+- alert_check: Periodic anomaly scan
 
-Idempotency:
-- Morning brief: one per date
-- Alerts: cooldown window per fingerprint
-- Weekly digest: one per week-ending date
+Idempotency: tracks last run per report type to avoid duplicates.
 """
 
-import json
 import logging
 from datetime import datetime, date, timedelta, timezone
+from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from api.models import InsightHistory, AlertState
-from api.db import async_session
-
-from analysis.baselines import compute_baselines, get_all_baselines
+from analysis.baselines import (
+    get_all_baselines,
+    compute_baselines,
+    _fetch_recovery_data,
+    _fetch_sleep_data,
+    _fetch_cycle_data,
+    _record_date,
+    _extract_metric_from_recovery,
+    _extract_sleep_duration,
+    _extract_strain,
+)
 from analysis.sleep import analyze_sleep
 from analysis.recovery import analyze_recovery
 from analysis.strain import analyze_strain
 from analysis.anomalies import detect_all_anomalies, Anomaly
 from analysis.correlations import analyze_correlations
-from analysis.investigations import investigate_anomalies
+from analysis.investigations import investigate_all
 from analysis.reporter import (
     format_morning_brief,
     format_post_workout,
     format_weekly_digest,
     format_alert,
-    send_telegram,
-    save_insight,
 )
 
 logger = logging.getLogger(__name__)
 
-ALERT_COOLDOWN_HOURS = 12
+# In-memory idempotency tracker (reset on restart — fine for single instance)
+_last_runs: dict[str, str] = {}  # report_type -> "YYYY-MM-DD"
 
 
-async def _already_sent(session: AsyncSession, event_type: str, date_key: str) -> bool:
-    """Check if we already sent this type of report for the given date."""
-    stmt = select(InsightHistory).where(
-        and_(
-            InsightHistory.event_type == event_type,
-            InsightHistory.results_json.contains(date_key),
-        )
-    ).limit(1)
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-async def _alert_on_cooldown(session: AsyncSession, fingerprint: str, user_id: str = "32850214") -> bool:
-    """Check if an alert fingerprint is within cooldown."""
-    stmt = select(AlertState).where(
-        and_(
-            AlertState.user_id == user_id,
-            AlertState.fingerprint == fingerprint,
-            AlertState.resolved == False,
-        )
-    ).limit(1)
-    result = await session.execute(stmt)
-    row = result.scalar_one_or_none()
-    if not row:
-        return False
-    if row.last_sent:
-        elapsed = datetime.now(timezone.utc) - row.last_sent.replace(tzinfo=timezone.utc)
-        return elapsed.total_seconds() < ALERT_COOLDOWN_HOURS * 3600
-    return False
+def _already_ran(report_type: str) -> bool:
+    return _last_runs.get(report_type) == _today_str()
 
 
-async def _record_alert(session: AsyncSession, anomaly: Anomaly, user_id: str = "32850214"):
-    """Record or update alert state."""
-    stmt = select(AlertState).where(
-        and_(
-            AlertState.user_id == user_id,
-            AlertState.fingerprint == anomaly.fingerprint,
-        )
-    ).limit(1)
-    result = await session.execute(stmt)
-    row = result.scalar_one_or_none()
-
-    if row:
-        row.last_sent = datetime.now(timezone.utc)
-        row.send_count = (row.send_count or 0) + 1
-        row.severity = anomaly.severity
-        row.detail_json = json.dumps({"description": anomaly.description}, default=str)
-    else:
-        session.add(AlertState(
-            user_id=user_id,
-            fingerprint=anomaly.fingerprint,
-            severity=anomaly.severity,
-            send_count=1,
-            detail_json=json.dumps({"description": anomaly.description}, default=str),
-        ))
-    await session.commit()
+def _mark_ran(report_type: str):
+    _last_runs[report_type] = _today_str()
 
 
-async def handle_sleep_event(event_payload: dict):
-    """
-    Called when a sleep webhook arrives. Triggers morning brief.
-    """
-    logger.info("Sleep event received: %s", event_payload.get("id", "unknown"))
-    async with async_session() as session:
-        today = date.today().isoformat()
-
-        # Idempotency: one morning brief per day
-        if await _already_sent(session, "morning_brief", today):
-            logger.info("Morning brief already sent for %s, skipping", today)
-            return
-
-        await run_morning_brief(today, session)
+def reset_idempotency():
+    """Reset for testing."""
+    _last_runs.clear()
 
 
-async def handle_workout_event(event_payload: dict):
-    """Called when a workout webhook arrives. Triggers post-workout report."""
-    logger.info("Workout event received: %s", event_payload.get("id", "unknown"))
-    async with async_session() as session:
-        await run_post_workout(session)
+async def run_morning_brief(session=None, force: bool = False) -> Optional[str]:
+    """Generate morning brief. Returns formatted message or None if already sent today."""
+    if not force and _already_ran("morning_brief"):
+        logger.info("Morning brief already sent today, skipping")
+        return None
+
+    recovery_data = await _fetch_recovery_data(7)
+    sleep_data = await _fetch_sleep_data(7)
+
+    if not recovery_data or not sleep_data:
+        logger.warning("No recovery or sleep data available for morning brief")
+        return None
+
+    latest_recovery = recovery_data[0]
+    latest_sleep = sleep_data[0]
+
+    recovery_score = _extract_metric_from_recovery(latest_recovery, "recovery")
+    hrv = _extract_metric_from_recovery(latest_recovery, "hrv")
+    rhr = _extract_metric_from_recovery(latest_recovery, "rhr")
+    spo2 = _extract_metric_from_recovery(latest_recovery, "spo2")
+    sleep_hours = _extract_sleep_duration(latest_sleep)
+
+    # Sleep quality from analysis
+    sleep_report = await analyze_sleep(session)
+    sleep_quality = None
+    if sleep_report and sleep_report.efficiency_pct is not None:
+        eff = sleep_report.efficiency_pct
+        if eff >= 85:
+            sleep_quality = f"Good efficiency ({eff:.0f}%)"
+        elif eff >= 70:
+            sleep_quality = f"Fair efficiency ({eff:.0f}%)"
+        else:
+            sleep_quality = f"Poor efficiency ({eff:.0f}%)"
+
+    # Anomalies
+    anomalies = await detect_all_anomalies(session)
+    investigations = await investigate_all(anomalies)
+
+    msg = format_morning_brief(
+        recovery_score, hrv, rhr, spo2, sleep_hours, sleep_quality,
+        anomalies, investigations,
+    )
+
+    _mark_ran("morning_brief")
+    return msg
 
 
-async def handle_recovery_event(event_payload: dict):
-    """Called when a recovery webhook arrives. Updates baselines and checks anomalies."""
-    logger.info("Recovery event received: %s", event_payload.get("id", "unknown"))
-    async with async_session() as session:
-        # Refresh baselines
-        await compute_baselines(session)
+async def run_post_workout(workout_data: dict, session=None) -> Optional[str]:
+    """Generate post-workout report from webhook data."""
+    score = workout_data.get("score", {})
+    strain = score.get("strain")
+    if strain is None:
+        return None
 
-        # Check for anomalies
+    # Get strain baseline for z-score
+    baselines = {}
+    if session:
         baselines = await get_all_baselines(session)
-        anomalies = await detect_all_anomalies(session)
-        investigations = await investigate_anomalies(anomalies, baselines)
+    strain_bl = baselines.get("strain", {}).get("30d")
+    strain_z = None
+    if strain_bl and strain_bl.std > 0:
+        strain_z = (strain - strain_bl.mean) / strain_bl.std
 
-        # Send alerts for severe anomalies
-        for anomaly in anomalies:
-            if anomaly.severity not in ("watch", "alert"):
-                continue
-            if await _alert_on_cooldown(session, anomaly.fingerprint):
-                logger.info("Alert %s on cooldown, skipping", anomaly.fingerprint)
-                continue
+    activity_name = workout_data.get("sport_id")  # WHOOP uses sport_id
+    duration_ms = score.get("duration_milli") or score.get("time_in_zones_milli")
+    duration_min = duration_ms / 60000 if duration_ms else None
+    avg_hr = score.get("average_heart_rate")
+    max_hr = score.get("max_heart_rate")
+    calories = score.get("kilojoule")
+    if calories is not None:
+        calories = calories * 0.239006  # kJ to kcal
 
-            inv = next((i for i in investigations if i.anomaly == anomaly), None)
-            msg = format_alert(anomaly, inv)
-            sent = await send_telegram(msg)
-            if sent:
-                await _record_alert(session, anomaly)
-                await save_insight(
-                    session, "alert",
-                    {"anomaly": anomaly.description, "severity": anomaly.severity},
-                    msg,
-                    alert_fingerprints=[anomaly.fingerprint],
-                )
+    return format_post_workout(
+        strain, strain_z, activity_name, duration_min, avg_hr, max_hr, calories,
+    )
 
 
-async def run_morning_brief(date_str: str = None, session: AsyncSession = None):
-    """Run the morning brief analysis and send to Telegram."""
-    if date_str is None:
-        date_str = date.today().isoformat()
+async def run_weekly_digest(session=None, force: bool = False) -> Optional[str]:
+    """Generate weekly digest. Returns formatted message or None."""
+    if not force and _already_ran("weekly_digest"):
+        logger.info("Weekly digest already sent today, skipping")
+        return None
 
-    own_session = session is None
-    if own_session:
-        ctx = async_session()
-        session = await ctx.__aenter__()
+    recovery_data = await _fetch_recovery_data(7)
+    sleep_data = await _fetch_sleep_data(7)
+    cycle_data = await _fetch_cycle_data(7)
 
-    try:
-        # Update baselines first
-        await compute_baselines(session)
-        baselines = await get_all_baselines(session)
+    if not recovery_data:
+        return None
 
-        # Run analyses
-        sleep_report = await analyze_sleep(session)
-        recovery_report = await analyze_recovery(session)
-        anomalies = await detect_all_anomalies(session)
-        investigations = await investigate_anomalies(anomalies, baselines)
+    import numpy as np
 
-        # Format and send
-        msg = format_morning_brief(sleep_report, recovery_report, anomalies, investigations)
-        sent = await send_telegram(msg)
+    recoveries = [_extract_metric_from_recovery(r, "recovery") for r in recovery_data]
+    recoveries = [r for r in recoveries if r is not None]
+    avg_recovery = float(np.mean(recoveries)) if recoveries else None
 
-        # Store insight
-        await save_insight(
-            session, "morning_brief",
-            {
-                "date": date_str,
-                "sleep_duration": sleep_report.last_sleep_duration_hrs,
-                "recovery_score": recovery_report.latest_score,
-                "anomaly_count": len(anomalies),
-            },
-            msg,
-        )
+    hrvs = [_extract_metric_from_recovery(r, "hrv") for r in recovery_data]
+    hrvs = [h for h in hrvs if h is not None]
+    avg_hrv = float(np.mean(hrvs)) if hrvs else None
 
-        logger.info("Morning brief for %s: %s", date_str, "sent" if sent else "stored (telegram not configured)")
-    finally:
-        if own_session:
-            await ctx.__aexit__(None, None, None)
+    sleeps = [_extract_sleep_duration(s) for s in sleep_data if not s.get("nap", False)]
+    sleeps = [s for s in sleeps if s is not None]
+    avg_sleep = float(np.mean(sleeps)) if sleeps else None
 
+    strains = [_extract_strain(c) for c in cycle_data]
+    strains = [s for s in strains if s is not None]
+    avg_strain = float(np.mean(strains)) if strains else None
 
-async def run_post_workout(session: AsyncSession = None):
-    """Run post-workout analysis and send."""
-    own_session = session is None
-    if own_session:
-        ctx = async_session()
-        session = await ctx.__aenter__()
+    # Best/worst day by recovery
+    best_day = worst_day = None
+    if recoveries and recovery_data:
+        day_scores = []
+        for r in recovery_data:
+            d = _record_date(r)
+            score = _extract_metric_from_recovery(r, "recovery")
+            if d and score is not None:
+                day_scores.append((d.strftime("%A %m/%d"), score))
+        if day_scores:
+            best_day = max(day_scores, key=lambda x: x[1])[0]
+            worst_day = min(day_scores, key=lambda x: x[1])[0]
 
-    try:
-        strain_report = await analyze_strain(session)
-        recovery_report = await analyze_recovery(session)
+    # Anomalies this week
+    anomalies = await detect_all_anomalies(session)
+    alert_count = sum(1 for a in anomalies if a.severity == "alert")
 
-        msg = format_post_workout(strain_report, recovery_report)
-        sent = await send_telegram(msg)
+    # Correlations
+    correlations = await analyze_correlations(session)
 
-        await save_insight(
-            session, "post_workout",
-            {
-                "strain": strain_report.latest_day_strain,
-                "acwr": strain_report.acute_chronic.ratio if strain_report.acute_chronic else None,
-            },
-            msg,
-        )
+    msg = format_weekly_digest(
+        avg_recovery, avg_hrv, avg_sleep, avg_strain,
+        best_day, worst_day, correlations,
+        len(anomalies), alert_count,
+    )
 
-        logger.info("Post-workout report: %s", "sent" if sent else "stored")
-    finally:
-        if own_session:
-            await ctx.__aexit__(None, None, None)
+    _mark_ran("weekly_digest")
+    return msg
 
 
-async def run_weekly_digest(week_end_date: str = None, session: AsyncSession = None):
-    """Run weekly digest and send."""
-    if week_end_date is None:
-        week_end_date = date.today().isoformat()
+async def run_alert_check(session=None) -> list[str]:
+    """Check for anomalies and return alert messages for any alert-severity items."""
+    anomalies = await detect_all_anomalies(session)
+    alerts = [a for a in anomalies if a.severity == "alert"]
 
-    own_session = session is None
-    if own_session:
-        ctx = async_session()
-        session = await ctx.__aenter__()
+    if not alerts:
+        return []
 
-    try:
-        # Idempotency
-        if await _already_sent(session, "weekly_digest", week_end_date):
-            logger.info("Weekly digest already sent for %s", week_end_date)
-            return
+    investigations = await investigate_all(alerts)
+    inv_map = {inv.anomaly.fingerprint: inv for inv in investigations}
 
-        await compute_baselines(session)
-        baselines = await get_all_baselines(session)
+    messages = []
+    for a in alerts:
+        inv = inv_map.get(a.fingerprint)
+        messages.append(format_alert(a, inv))
 
-        sleep_report = await analyze_sleep(session)
-        recovery_report = await analyze_recovery(session)
-        strain_report = await analyze_strain(session)
-        correlations = await analyze_correlations()
-        anomalies = await detect_all_anomalies(session)
+    return messages
 
-        msg = format_weekly_digest(sleep_report, recovery_report, strain_report, correlations, anomalies)
-        sent = await send_telegram(msg)
 
-        await save_insight(
-            session, "weekly_digest",
-            {
-                "week_end": week_end_date,
-                "recovery_7d_avg": recovery_report.trend.avg_7d if recovery_report.trend else None,
-                "sleep_7d_avg": sleep_report.trend.duration_7d_avg_hrs if sleep_report.trend else None,
-            },
-            msg,
-        )
-
-        logger.info("Weekly digest for %s: %s", week_end_date, "sent" if sent else "stored")
-    finally:
-        if own_session:
-            await ctx.__aexit__(None, None, None)
+async def handle_webhook(event_type: str, data: dict, session=None) -> Optional[str]:
+    """Handle WHOOP webhook events. Returns message to send or None."""
+    if event_type == "recovery.updated":
+        return await run_morning_brief(session)
+    elif event_type == "workout.updated":
+        return await run_post_workout(data, session)
+    elif event_type == "sleep.updated":
+        # Sleep update can also trigger morning brief
+        return await run_morning_brief(session)
+    return None

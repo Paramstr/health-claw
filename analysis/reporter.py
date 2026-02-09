@@ -1,276 +1,211 @@
 """
-analysis/reporter.py — Formats analysis results into Telegram messages.
+analysis/reporter.py — Format analysis results for Telegram.
 
-Sends to "Param Health" Telegram group using existing Telegram config.
-Saves sent messages in InsightHistory table.
+Report types:
+- morning_brief: Post-sleep summary (recovery, sleep, anomalies)
+- post_workout: After high strain (strain, recovery impact)
+- weekly_digest: Sunday summary (trends, correlations, best/worst)
+- alert: Immediate anomaly alerts
+
+All formatting is Telegram HTML. No generic health advice — everything grounded in data.
 """
 
-import json
 import logging
-import os
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from typing import Optional
 
-import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from api.models import InsightHistory
-from analysis.sleep import SleepReport
-from analysis.recovery import RecoveryReport
-from analysis.strain import StrainReport
 from analysis.anomalies import Anomaly
 from analysis.investigations import Investigation
-from analysis.correlations import CorrelationsReport
+from analysis.correlations import CorrelationsReport, SleepRecoveryQuantified
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SEVERITY_EMOJI = {"alert": "🚨", "watch": "⚠️", "info": "ℹ️"}
+METRIC_EMOJI = {
+    "hrv": "💓", "rhr": "❤️", "recovery": "🔋", "spo2": "🫁",
+    "sleep_duration": "😴", "strain": "🏋️",
+}
 
 
-async def send_telegram(text: str) -> bool:
-    """Send a message to the configured Telegram chat."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-            if resp.status_code == 200:
-                logger.info("Telegram message sent (%d chars)", len(text))
-                return True
-            else:
-                logger.error("Telegram send failed: %s %s", resp.status_code, resp.text)
-                return False
-    except Exception:
-        logger.exception("Telegram send error")
-        return False
+@dataclass
+class ReportSection:
+    title: str
+    body: str
+    priority: int = 0  # higher = more important
 
 
-async def save_insight(
-    session: Optional[AsyncSession],
-    event_type: str,
-    results_json: dict,
-    message_text: str,
-    alert_fingerprints: Optional[list[str]] = None,
-    window_start: Optional[datetime] = None,
-    window_end: Optional[datetime] = None,
-    user_id: str = "32850214",
-):
-    """Save an insight to the history table."""
-    if not session:
-        return
-    session.add(InsightHistory(
-        user_id=user_id,
-        event_type=event_type,
-        results_json=json.dumps(results_json, default=str),
-        message_text=message_text,
-        alert_fingerprints=json.dumps(alert_fingerprints) if alert_fingerprints else None,
-        input_window_start=window_start,
-        input_window_end=window_end,
-    ))
-    await session.commit()
+def _fmt_anomaly(a: Anomaly) -> str:
+    emoji = SEVERITY_EMOJI.get(a.severity, "")
+    return f"{emoji} <b>{a.severity.upper()}</b>: {a.description}"
+
+
+def _fmt_investigation(inv: Investigation) -> str:
+    lines = [f"🔍 <b>Likely cause: {inv.hypothesis.replace('_', ' ').title()}</b> ({inv.confidence} confidence)"]
+    for link in inv.cause_chain[:4]:
+        prefix = f"  └ Day-{link.days_prior}" if link.days_prior > 0 else "  └ Today"
+        lines.append(f"{prefix}: {link.observation}")
+    lines.append(f"💡 {inv.recommendation}")
+    return "\n".join(lines)
 
 
 def format_morning_brief(
-    sleep: SleepReport,
-    recovery: RecoveryReport,
+    recovery_score: Optional[float],
+    hrv: Optional[float],
+    rhr: Optional[float],
+    spo2: Optional[float],
+    sleep_hours: Optional[float],
+    sleep_quality: Optional[str],
     anomalies: list[Anomaly],
     investigations: list[Investigation],
 ) -> str:
-    """Format the morning brief message."""
-    lines = ["☀️ <b>Morning Brief</b>"]
-    lines.append("")
+    """Format the morning brief report."""
+    lines = ["☀️ <b>Morning Brief</b>", ""]
 
-    # Sleep summary
-    lines.append("💤 <b>Sleep</b>")
-    if sleep.last_sleep_duration_hrs is not None:
-        dur = sleep.last_sleep_duration_hrs
-        lines.append(f"  Duration: {dur:.1f}h", )
-        if sleep.duration_vs_baseline_pct is not None:
-            lines[-1] += f" ({sleep.duration_vs_baseline_pct:+.0f}% vs baseline)"
-    if sleep.efficiency_pct is not None:
-        lines.append(f"  Efficiency: {sleep.efficiency_pct:.0f}%")
-    if sleep.stages:
-        s = sleep.stages
-        lines.append(f"  Stages: REM {s.current_rem_pct:.0f}% | Deep {s.current_deep_pct:.0f}% | Light {s.current_light_pct:.0f}%")
-        if s.rem_flag or s.deep_flag:
-            flags = []
-            if s.rem_flag:
-                flags.append(f"REM {s.rem_flag}")
-            if s.deep_flag:
-                flags.append(f"Deep {s.deep_flag}")
-            lines.append(f"  ⚠️ {', '.join(flags)} vs your norm")
-    if sleep.debt and sleep.debt.current_debt_hrs > 2:
-        lines.append(f"  Sleep debt: {sleep.debt.current_debt_hrs:.1f}h ({sleep.debt.trend})")
-    if sleep.trend and sleep.trend.direction != "stable":
-        lines.append(f"  Trend: {sleep.trend.direction} ({sleep.trend.duration_slope_hrs_per_day:+.2f}h/day)")
-
-    lines.append("")
-
-    # Recovery summary
-    lines.append("💚 <b>Recovery</b>")
-    if recovery.latest_score is not None:
-        emoji = "🟢" if recovery.latest_score >= 67 else "🟡" if recovery.latest_score >= 34 else "🔴"
-        lines.append(f"  {emoji} Score: {recovery.latest_score:.0f}%")
-        if recovery.score_vs_baseline_pct is not None:
-            lines[-1] += f" ({recovery.score_vs_baseline_pct:+.0f}% vs baseline)"
-    if recovery.trend and recovery.trend.direction != "stable":
-        lines.append(f"  Trend: {recovery.trend.direction} over last 7d (avg {recovery.trend.avg_7d:.0f}%)")
-    if recovery.prediction:
-        p = recovery.prediction
-        if p.divergence_flag:
-            lines.append(f"  ⚠️ Expected {p.predicted_score:.0f}% from sleep, got {p.actual_score:.0f}%")
-
-    # Readiness
-    lines.append("")
-    if recovery.latest_score is not None:
-        if recovery.latest_score >= 67:
-            lines.append("✅ <b>Ready for high intensity today</b>")
-        elif recovery.latest_score >= 50:
-            lines.append("⚡ <b>Moderate intensity recommended</b>")
-        elif recovery.latest_score >= 34:
-            lines.append("🧘 <b>Light activity or active recovery</b>")
+    # Recovery overview
+    if recovery_score is not None:
+        if recovery_score >= 67:
+            emoji = "🟢"
+        elif recovery_score >= 34:
+            emoji = "🟡"
         else:
-            lines.append("🛏️ <b>Rest day recommended</b>")
+            emoji = "🔴"
+        lines.append(f"{emoji} Recovery: <b>{recovery_score:.0f}%</b>")
 
-    # Anomalies & investigations
-    alerts = [a for a in anomalies if a.severity in ("watch", "alert")]
+    metrics = []
+    if hrv is not None:
+        metrics.append(f"💓 HRV: {hrv:.0f}ms")
+    if rhr is not None:
+        metrics.append(f"❤️ RHR: {rhr:.0f} bpm")
+    if spo2 is not None:
+        metrics.append(f"🫁 SpO2: {spo2:.1f}%")
+    if metrics:
+        lines.append(" · ".join(metrics))
+
+    # Sleep
+    if sleep_hours is not None:
+        lines.append(f"\n😴 Sleep: <b>{sleep_hours:.1f}h</b>")
+        if sleep_quality:
+            lines.append(f"   {sleep_quality}")
+
+    # Anomalies
+    alerts = [a for a in anomalies if a.severity in ("alert", "watch")]
     if alerts:
         lines.append("")
-        lines.append("🚨 <b>Alerts</b>")
         for a in alerts:
-            icon = "🔴" if a.severity == "alert" else "🟡"
-            lines.append(f"  {icon} {a.description}")
+            lines.append(_fmt_anomaly(a))
 
+    # Investigations
+    if investigations:
+        lines.append("")
         for inv in investigations:
-            if inv.anomaly in alerts and inv.cause_chain:
-                lines.append(f"  → {inv.summary}")
+            lines.append(_fmt_investigation(inv))
+
+    if not alerts and not investigations:
+        lines.append("\n✅ All metrics within normal range.")
 
     return "\n".join(lines)
 
 
 def format_post_workout(
-    strain: StrainReport,
-    recovery: RecoveryReport,
+    strain: float,
+    strain_z: Optional[float],
+    activity_name: Optional[str],
+    duration_min: Optional[float],
+    avg_hr: Optional[float],
+    max_hr: Optional[float],
+    calories: Optional[float],
 ) -> str:
-    """Format the post-workout message."""
-    lines = ["🏋️ <b>Post-Workout</b>"]
-    lines.append("")
+    """Format post-workout report."""
+    lines = ["🏋️ <b>Post-Workout</b>", ""]
 
-    if strain.latest_day_strain is not None:
-        lines.append(f"  Day strain: {strain.latest_day_strain:.1f}")
-        if strain.strain_vs_baseline_pct is not None:
-            lines[-1] += f" ({strain.strain_vs_baseline_pct:+.0f}% vs baseline)"
+    if activity_name:
+        lines.append(f"Activity: <b>{activity_name}</b>")
 
-    if strain.acute_chronic:
-        ac = strain.acute_chronic
-        lines.append(f"  Acute:Chronic ratio: {ac.ratio:.2f} ({ac.risk_level} risk)")
+    lines.append(f"Strain: <b>{strain:.1f}</b>")
+    if strain_z is not None:
+        if abs(strain_z) > 2:
+            lines.append(f"   {'⬆️ Well above' if strain_z > 0 else '⬇️ Well below'} your usual (z={strain_z:+.1f})")
+        elif abs(strain_z) > 1:
+            lines.append(f"   {'↗️ Above' if strain_z > 0 else '↘️ Below'} average (z={strain_z:+.1f})")
 
-    if strain.balance:
-        b = strain.balance
-        lines.append(f"  Strain-recovery balance: {b.ratio_trend}")
-        if b.drift_direction:
-            lines.append(f"  ⚠️ Gap {b.drift_direction}")
+    details = []
+    if duration_min is not None:
+        details.append(f"⏱ {duration_min:.0f} min")
+    if avg_hr is not None:
+        details.append(f"❤️ Avg {avg_hr:.0f} bpm")
+    if max_hr is not None:
+        details.append(f"Max {max_hr:.0f} bpm")
+    if calories is not None:
+        details.append(f"🔥 {calories:.0f} cal")
+    if details:
+        lines.append(" · ".join(details))
 
-    if strain.overtraining and strain.overtraining.detected:
-        ot = strain.overtraining
-        lines.append(f"  ⚠️ Overtraining signal ({ot.confidence})")
-
-    # Projected recovery impact
-    lines.append("")
-    if recovery.latest_score is not None and strain.latest_day_strain is not None:
-        if strain.latest_day_strain > 16:
-            lines.append("📉 High strain — expect lower recovery tomorrow")
-        elif strain.latest_day_strain > 12:
-            lines.append("📊 Moderate strain — recovery should hold steady")
-        else:
-            lines.append("📈 Light day — recovery likely to improve")
-
-    if strain.flags:
-        lines.append("")
-        for f in strain.flags:
-            lines.append(f"  ⚠️ {f}")
+    if strain > 16:
+        lines.append("\n💡 High strain day — prioritize sleep and hydration tonight.")
 
     return "\n".join(lines)
 
 
 def format_weekly_digest(
-    sleep: SleepReport,
-    recovery: RecoveryReport,
-    strain: StrainReport,
-    correlations: CorrelationsReport,
-    anomalies: list[Anomaly],
+    avg_recovery: Optional[float],
+    avg_hrv: Optional[float],
+    avg_sleep: Optional[float],
+    avg_strain: Optional[float],
+    best_day: Optional[str],
+    worst_day: Optional[str],
+    correlations: Optional[CorrelationsReport],
+    anomaly_count: int,
+    alert_count: int,
 ) -> str:
-    """Format the weekly digest message."""
-    lines = ["📊 <b>Weekly Digest</b>"]
-    lines.append("")
+    """Format Sunday weekly digest."""
+    lines = ["📊 <b>Weekly Digest</b>", ""]
 
-    # Week trends
-    lines.append("<b>Trends This Week</b>")
-    if recovery.trend:
-        lines.append(f"  Recovery: {recovery.trend.direction} (7d avg {recovery.trend.avg_7d:.0f}%)")
-    if sleep.trend:
-        lines.append(f"  Sleep: {sleep.trend.direction} (7d avg {sleep.trend.duration_7d_avg_hrs:.1f}h)")
-    if strain.acute_chronic:
-        lines.append(f"  Load: {strain.acute_chronic.acute_7d:.1f} avg daily strain (ACWR {strain.acute_chronic.ratio:.2f})")
+    # Averages
+    lines.append("<b>This Week's Averages</b>")
+    if avg_recovery is not None:
+        lines.append(f"  🔋 Recovery: {avg_recovery:.0f}%")
+    if avg_hrv is not None:
+        lines.append(f"  💓 HRV: {avg_hrv:.0f}ms")
+    if avg_sleep is not None:
+        lines.append(f"  😴 Sleep: {avg_sleep:.1f}h/night")
+    if avg_strain is not None:
+        lines.append(f"  🏋️ Strain: {avg_strain:.1f}/day")
 
-    # Workout summary
-    if strain.workout_dist:
-        d = strain.workout_dist
+    # Best/worst
+    if best_day or worst_day:
         lines.append("")
-        lines.append("<b>Workouts</b>")
-        lines.append(f"  {d.total_workouts} sessions | Avg strain {d.avg_strain_per_workout:.1f}")
-        lines.append(f"  High {d.high_intensity_count} | Moderate {d.moderate_count} | Low {d.low_count}")
-
-    # Consistency
-    if sleep.consistency:
-        lines.append("")
-        lines.append("<b>Consistency</b>")
-        lines.append(f"  Sleep timing score: {sleep.consistency.consistency_score:.0f}/100")
-        lines.append(f"  Bedtime variance: ±{sleep.consistency.bedtime_std_minutes:.0f}min")
-
-    # Patterns
-    if correlations.sleep_to_recovery:
-        s2r = correlations.sleep_to_recovery
-        lines.append("")
-        lines.append("<b>Patterns</b>")
-        lines.append(f"  {s2r.interpretation}")
-
-    if correlations.bounce_back:
-        bb = correlations.bounce_back
-        lines.append(f"  Recovery bounce-back: ~{bb.avg_days_to_recover:.1f} days after high strain")
+        if best_day:
+            lines.append(f"🏆 Best day: {best_day}")
+        if worst_day:
+            lines.append(f"📉 Toughest day: {worst_day}")
 
     # Alerts summary
-    alert_count = sum(1 for a in anomalies if a.severity in ("watch", "alert"))
-    if alert_count:
-        lines.append("")
-        lines.append(f"⚠️ {alert_count} alert(s) this week — check daily briefs for details")
+    if anomaly_count > 0:
+        lines.append(f"\n⚡ {anomaly_count} anomalies detected ({alert_count} alerts)")
+
+    # Correlations insights
+    if correlations and correlations.sleep_to_recovery:
+        s2r = correlations.sleep_to_recovery
+        if abs(s2r.correlation) > 0.3:
+            lines.append(f"\n📈 <b>Insight:</b> {s2r.interpretation}")
+
+    if correlations and correlations.bounce_back:
+        bb = correlations.bounce_back
+        lines.append(f"🔄 After hard training days, you typically bounce back in ~{bb.avg_days_to_recover:.1f} days")
+
+    if correlations and correlations.day_of_week:
+        sig = [p for p in correlations.day_of_week if p.significant]
+        for p in sig[:2]:
+            lines.append(f"📅 {p.metric}: best on {p.best_day}, weakest on {p.worst_day}")
 
     return "\n".join(lines)
 
 
 def format_alert(anomaly: Anomaly, investigation: Optional[Investigation] = None) -> str:
-    """Format an immediate alert message."""
-    icon = "🔴" if anomaly.severity == "alert" else "🟡" if anomaly.severity == "watch" else "ℹ️"
-    lines = [f"{icon} <b>Health Alert — {anomaly.metric.upper()}</b>"]
-    lines.append("")
-    lines.append(anomaly.description)
-
-    if investigation and investigation.cause_chain:
+    """Format an immediate alert."""
+    lines = [_fmt_anomaly(anomaly)]
+    if investigation:
         lines.append("")
-        lines.append("<b>Investigation:</b>")
-        for c in investigation.cause_chain:
-            contrib_icon = "→" if c.contribution == "likely" else "·"
-            lines.append(f"  {contrib_icon} {c.factor}: {c.evidence}")
-        lines.append("")
-        lines.append(investigation.summary)
-
+        lines.append(_fmt_investigation(investigation))
     return "\n".join(lines)
