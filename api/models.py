@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Text, BigInteger, Boolean, func
+from sqlalchemy import Column, String, DateTime, Text, BigInteger, Boolean, Float, Integer, func
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -52,3 +52,51 @@ class RawRecovery(Base):
     user_id = Column(String, nullable=False, index=True)
     payload_json = Column(Text, nullable=False)
     received_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ─── Analysis tables ───────────────────────────────────────────────
+
+class Baseline(Base):
+    """Rolling 7d/30d baselines per metric per user."""
+    __tablename__ = "baselines"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String, nullable=False, index=True)
+    metric = Column(String, nullable=False)          # e.g. "hrv", "rhr", "sleep_duration", "strain", "recovery", "spo2"
+    window = Column(String, nullable=False)           # "7d" or "30d"
+    mean = Column(Float, nullable=False)
+    std = Column(Float, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    computed_at = Column(DateTime(timezone=True), server_default=func.now())
+    window_start = Column(DateTime(timezone=True), nullable=False)
+    window_end = Column(DateTime(timezone=True), nullable=False)
+
+
+class InsightHistory(Base):
+    """Stores every generated insight/report."""
+    __tablename__ = "insight_history"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String, nullable=False, index=True)
+    event_type = Column(String, nullable=False)       # morning_brief, post_workout, weekly_digest, alert
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    input_window_start = Column(DateTime(timezone=True))
+    input_window_end = Column(DateTime(timezone=True))
+    results_json = Column(Text, nullable=False)       # structured JSON payload
+    message_text = Column(Text)                       # final Telegram message
+    alert_fingerprints = Column(Text)                 # JSON array of fingerprints if any
+
+
+class AlertState(Base):
+    """Deduplicates alerts by fingerprint with cooldown."""
+    __tablename__ = "alert_state"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String, nullable=False, index=True)
+    fingerprint = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False)         # info, watch, alert
+    first_seen = Column(DateTime(timezone=True), server_default=func.now())
+    last_sent = Column(DateTime(timezone=True), server_default=func.now())
+    send_count = Column(Integer, nullable=False, default=1)
+    resolved = Column(Boolean, default=False, nullable=False)
+    detail_json = Column(Text)                        # structured detail
