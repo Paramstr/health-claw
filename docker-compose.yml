@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: whoop-postgres
+    env_file: .env
+    environment:
+      POSTGRES_DB: whoop
+      POSTGRES_USER: whoop
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-whoop_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whoop"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - whoop-net
+
+volumes:
+  pgdata:
+
+networks:
+  whoop-net:
+    name: whoop-net
+    driver: bridge
