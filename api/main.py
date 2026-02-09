@@ -37,6 +37,27 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="whoop-ingest", lifespan=lifespan)
 
 
+# ---------- analysis event handlers ----------
+ANALYSIS_HANDLERS = {
+    "sleep": None,
+    "workout": None,
+    "recovery": None,
+}
+
+def _get_analysis_handler(kind: str):
+    """Lazy import analysis handlers to avoid circular imports."""
+    if ANALYSIS_HANDLERS.get(kind) is None:
+        try:
+            from analysis.scheduler import handle_sleep_event, handle_workout_event, handle_recovery_event
+            ANALYSIS_HANDLERS["sleep"] = handle_sleep_event
+            ANALYSIS_HANDLERS["workout"] = handle_workout_event
+            ANALYSIS_HANDLERS["recovery"] = handle_recovery_event
+        except ImportError:
+            logger.warning("Analysis module not available")
+            return None
+    return ANALYSIS_HANDLERS.get(kind)
+
+
 # ---------- hydration (runs as background task) ----------
 async def hydrate(event_type: str, whoop_id: str, user_id: str, event_db_id: int):
     kind = event_type.split(".")[0]
@@ -58,6 +79,15 @@ async def hydrate(event_type: str, whoop_id: str, user_id: str, event_db_id: int
             await session.commit()
 
         logger.info("Stored %s %s for user %s", kind, whoop_id, user_id)
+
+        # Trigger analysis after successful hydration
+        handler = _get_analysis_handler(kind)
+        if handler:
+            try:
+                await handler({"id": whoop_id, "type": event_type, "user_id": user_id})
+            except Exception:
+                logger.exception("Analysis handler failed for %s %s (non-fatal)", kind, whoop_id)
+
     except Exception:
         logger.exception("Failed to hydrate %s %s", kind, whoop_id)
 
